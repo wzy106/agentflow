@@ -22,8 +22,10 @@ from openai import OpenAI
 # 改 base_url 就能连 DeepSeek、Ollama 等任何兼容服务。
 
 from tools import execute, get_all_schemas
+from memory import ConversationMemory
 # execute(name, **kwargs)        → 按名字执行工具（查字典 → 调函数）
 # get_all_schemas()              → 获取所有工具的说明书（给 AI 看）
+# ConversationMemory             → 对话记忆——让 AI 记住之前的对话
 
 load_dotenv()
 # 把 .env 里的三行密码加载到内存
@@ -35,72 +37,63 @@ client = OpenAI(
 # 创建 API 客户端。参数名 api_key/base_url 是库定死的，必须小写。
 # 变量名 client 是你起的，可以随便换。
 
+# 全局对话记忆——所有 chat() 调用共享同一本日记本
+memory = ConversationMemory(
+    system_prompt="你是一个助手。遇到计算、搜索、代码执行必须用对应工具，不要自己猜。"
+)
+# system_prompt 在创建日记本时写进第一页——之后每次 get_messages() 都会带上。
+# 这是全局变量（模块级），所有 chat() 调用共享——所以能跨轮记住上下文。
+
 
 # ====== 核心函数 ======
 
 def chat(user_input: str) -> str:
 #          ^^^^^^^^^^^^         ^^^^^^
 #     参数：用户输入字符串       返回：AI 的回复字符串
-    """完整版 ReAct 循环——AI 可以连续调用多个工具，直到信息够了为止"""
+    """完整版 ReAct 循环 + 对话记忆——AI 能跨轮记住上下文"""
 
-    # ====== 第 1 步：构建对话记录 ======
-    messages = [
-        {"role": "system", "content": "你是一个助手。遇到计算、搜索、代码执行必须用对应工具，不要自己猜。"},
-        {"role": "user", "content": user_input},
-    ]
+    # ====== 第 1 步：把用户消息写进日记本 ======
+    memory.add_user_message(user_input)
+    # 不再每次新建 messages 列表！从全局记忆拿已有的历史。
+    # 这样上一轮说过的话还留在日记本里，AI 能看到。
 
     # ====== 第 2 步：ReAct 循环 ======
-    max_steps = 10      # 最多循环 10 次，防止死循环
-    step = 0            # 当前步数计数器
+    max_steps = 10
+    step = 0
 
     while step < max_steps:
         step += 1
 
-        # 每轮都拿工具说明书 + 传 tools 参数
-        # 和简化版的区别：不只是第一轮传 tools，每一轮都传！
-        # 因为 AI 每轮都可能需要继续调工具。
         tools = get_all_schemas()
         response = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL"),
-            messages=messages,
-            tools=tools,        # 每轮都传——AI 随时可以调新工具
+            messages=memory.get_messages(),  # ← 从记忆拿全部历史（带滑动窗口）
+            tools=tools,
         )
         msg = response.choices[0].message
 
-        # ====== 不需要工具 → 这是最终回答！ ======
+        # ====== 不需要工具 → 最终回答！ ======
         if not msg.tool_calls:
+            memory.add_assistant_message(msg.content)
+            # ← 把 AI 的最终回答也写进日记本（下一轮对话能看到）
             return msg.content
-            # 简化版这里要手动调第二轮（不带 tools）做总结。
-            # 完整版不需要——while 循环本身就是"持续调工具"的过程。
-            # AI 觉得够了就停止返回 tool_calls，直接输出自然语言回答。
 
-        # ====== 需要工具 → 构建 assistant 消息 ======
-        messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [
-                {"id": tc.id, "type": "function",
-                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                for tc in msg.tool_calls
-            ]
-        })
+        # ====== 需要工具 → 写进日记本 ======
+        tool_calls_list = [
+            {"id": tc.id, "type": "function",
+             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in msg.tool_calls
+        ]
+        memory.add_assistant_message(msg.content or "", tool_calls_list)
+        # ← 用日记本的方法写，不用手写 messages.append
 
         # ====== 逐个执行工具 ======
         for tc in msg.tool_calls:
-            func_name = tc.function.name
-            func_args = json.loads(tc.function.arguments)
-            result = execute(func_name, **func_args)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
-        # 循环回到 while 顶部——工具结果已在 messages 里。
-        # 下一轮 AI 看到工具结果，判断"还需要更多工具吗？"
-        # 够 → 直接回答（tool_calls 为空 → 走 if 返回）。
-        # 不够 → 继续调工具（tool_calls 不为空 → 再执行）。
+            args = json.loads(tc.function.arguments)
+            result = execute(tc.function.name, **args)
+            memory.add_tool_result(tc.id, result)
+            # ← 工具结果也写日记本——用 ID 对应
 
-    # 走到这里说明 10 步用完还没结束
     return "达到最大步数，暂时无法完成。请简化你的问题。"
 
 
@@ -214,3 +207,34 @@ if __name__ == "__main__":
 # A15: OpenAI 协议强制要求。AI 调的每个工具有唯一 ID（tc.id），
 #      工具结果必须带同一个 ID。AI 靠 ID 匹配"哪个调用对应哪个结果"。
 #      同时调两个工具时 ID 确保返回结果不会对错号。
+#
+# Q16: 为什么 msg 自带 content、tool_calls 这些属性？谁放进去的？
+# A16: OpenAI SDK 在收到 API 返回的 JSON 响应后，自动把每个 JSON 字段映射到 Python 对象属性上。
+#      API 返回的 JSON 里有 "content" → msg.content 就能取到值。
+#      API 返回的 JSON 里有 "tool_calls" → msg.tool_calls 就能取到值。
+#      这套映射是 OpenAI 定死的——API 返回什么字段，对象就有什么属性。你一个都不能改。
+#      你不需要给 msg 赋值，SDK 在创建对象时已经把所有字段填好了。
+#
+# Q17: 为什么手动构建 assistant 消息而不是直接 messages.append(msg)？
+# A17: 两个原因。①和 server.py 统一：server.py 必须手动拆（json.dumps 不认识 SDK 对象），
+#      agent.py 统一写法方便维护。②透明性：手动构建后 messages 里全是 Python 原生字典，
+#      打印出来一目了然。直接 append SDK 对象，打印出来是一大堆嵌套类型名，查 bug 困难。
+#      手动构建不是为了"能跑"（直接 append 也能跑），是为了"好查"。
+#
+# Q18: Day 12 的记忆系统做了什么？（新增 memory.py）
+# A18: 之前每次 chat() 都新建 messages 列表——上一轮对话全丢。
+#      现在全局 ConversationMemory 实例维护一个跨轮共享的消息历史。
+#      chat() 不再创建新的 messages，而是往记忆里追加新消息。
+#      用户说"我叫小明"→ 下一轮问"我叫什么"→ AI 能看到完整历史 → "你叫小明"。
+#
+# Q19: memory = ConversationMemory(...) 为什么定义在 chat() 外面？
+# A19: 全局变量——所有 chat() 调用共享同一个实例。
+#      定义在函数里面的话每次调用都会新建日记本，和之前没有区别。
+#      放在外面 → 模块加载时创建一次 → 之后所有调用都往同一本日记本里写。
+#
+# Q20: memory.add_user_message、add_assistant_message、add_tool_result 分别干了什么？
+# A20: 三个方法代替了原来手写 messages.append({...})。
+#      add_user_message → 往记忆里追加 role="user" 的消息。
+#      add_assistant_message → 追加 role="assistant"，如果调了工具一并贴上 tool_calls。
+#      add_tool_result → 追加 role="tool"，绑定 tool_call_id。
+#      好处：不用记字段名，不用写重复的 {"role":"...","content":"..."}。
