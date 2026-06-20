@@ -11,6 +11,7 @@ Day 4-5：工具注册表（插件式工具系统）
 from calculator import safe_calc
 from web_search import web_search
 from code_exec import execute_code
+from rag import rag
 
 
 # ====== 全局变量 ======
@@ -158,6 +159,23 @@ register(
 )
 
 
+# ====== Day 16 新增：RAG 文档搜索工具 ======
+
+def search_docs(query: str) -> str:
+    """从用户上传的知识库中搜索相关文档内容"""
+    results = rag.retrieve(query)
+    if not results:
+        return "知识库中没有找到相关内容"
+    return "\n\n".join(results)
+
+register(
+    "search_docs",
+    "从用户上传的知识库中搜索相关文档内容。用户问到特定项目、产品、公司相关问题时使用",
+    {"query": {"type": "string", "description": "搜索关键词"}},
+    search_docs,
+)
+
+
 # ====== Q&A 问答笔记 ======
 #
 # Q1: _tools 和 _schemas 有什么区别？
@@ -192,3 +210,8 @@ register(
 # A7: 没有 register → 加一个工具要改 agent.py 三处（import、说明书、if-else）。
 #     有 register → 加一个工具只加四行 register()，agent.py 一行不用动。
 #     这就是"开闭原则"——对扩展开放，对修改封闭。
+#
+# Q8: Day 16 加 search_docs 工具时 agent.py 改了几行？
+# A8: 零行。只在 tools.py 里加了一个函数 + 一个 register()。
+#     agent.py 的 while 循环自动拿到新工具的说明书，AI 自动决定什么时候调它。
+#     这就是注册表模式的价值——第四个工具和第一个工具加法一模一样。

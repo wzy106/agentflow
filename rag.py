@@ -1,181 +1,195 @@
 """
-Day 15：RAG 文档检索 —— 先查文档，再回答
-=============================================
-RAG = Retrieval Augmented Generation（检索增强生成）。
-把用户上传的文档切成小块存起来，提问时找到最相关的几块，喂给 AI 参考。
-
-类比：
-  上传文档 = 往书架上放书
-  提问搜索 = 根据关键词去书架上找到对应那本书，翻到相关那页
+Day 18：FAISS 向量 RAG —— 语义匹配 + 持久化
+==============================================
+Day 15 的简化版用关键词/字符重叠匹配——"退货"搜不到"退款"。
+Day 18 升级为向量语义匹配——意思相近就能搜到，重启数据不丢。
 """
 
+import os
+# 国内镜像必须在 import sentence_transformers 之前设置！
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import re
-# re = 正则表达式模块，用它按段落空行切分文档。
+import pickle
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
 
-class SimpleRAG:
-    # SimpleRAG = 你起的类名，不是专有名词。可以叫 DocStore、KnowledgeBase 都行。
-    """简单的文档检索——基于词重叠 + 字符重叠匹配"""
+class VectorRAG:
+    """向量语义检索——把文字变成数字，找最近的"""
 
-    def __init__(self):
-        # __init__ = Python 内置方法，创建实例时自动调用。
-        self.chunks = []       # 文档块列表——你起的属性名
-        self.sources = []      # 每块来自哪个文件——你起的属性名
-        # chunks 和 sources 一一对应：chunks[i] 的内容来自 sources[i]。
-        # 两个列表必须同步 append，否则索引对不上。
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", data_dir: str = "./data/rag"):
+        # 加载 embedding 模型（第一次从镜像下载，之后从本地加载）
+        print("正在加载 embedding 模型...")
+        self.model = SentenceTransformer(model_name)
+        self.dim = self.model.get_embedding_dimension()  # 384
+
+        # FAISS 索引（向量搜索引擎）
+        self.index = faiss.IndexFlatL2(self.dim)
+        # IndexFlatL2 = 暴力 L2 距离搜索（精确但较慢）
+        # self.dim = 384 维
+
+        # 文档元数据
+        self.chunks = []       # 文档块原文
+        self.sources = []      # 每块来源
+
+        # 持久化路径
+        self.data_dir = data_dir
+        os.makedirs(data_dir, exist_ok=True)
+
+        # 尝试从硬盘加载已有数据
+        self._load()
 
     def ingest(self, text: str, source: str = "上传文件") -> int:
-        # ingest = 你起的方法名（意为"摄入"）。text = 要存的文档全文（你起的参数名）。
-        # source = 来源标记（你起的）。-> int = 返回整数——切了多少块。
-        """
-        把一段文字切块并存储。返回切了多少块。
-        """
-        # ====== 按段落切分 ======
-        # re.split(r"\n\s*\n", text.strip())
-        #   \n   = 换行符
-        #   \s*  = 零个或多个空白字符（空格、Tab、残留的空行）
-        #   \n   = 又一个换行符
-        #   合起来 = 匹配段落之间的空行（不管是 Windows \r\n 还是 Linux \n）
-        #   text.strip() 先把首尾空白去掉，防止开头空行被切出一个空段落。
-        #
-        # r"..." = 原始字符串——\n 保持原样交给 re 模块解释。
+        """切块 → 向量化 → 存进 FAISS → 保存到硬盘"""
         paragraphs = re.split(r"\n\s*\n", text.strip())
-
-        count = 0   # 计数器——这次切了多少有效块
+        new_chunks = []
 
         for para in paragraphs:
-            para = para.strip()                  # 再去一遍首尾空白
-            if len(para) > 30:                   # 太短的跳过（标题、空行残留）
-                self.chunks.append(para[:1000])  # 每块最多 1000 字
-                # [:1000] = 切片——从头取到第 1000 个字符（不含第 1000 个）
-                # 等价于 [0:1000]。防止某一段特别长撑爆内存。
-                self.sources.append(source)      # 记录来源（和 chunks 同步 append！）
-                count += 1
-        return count
-        # 返回实际存储的块数。跳过的不算。
+            para = para.strip()
+            if len(para) > 30:
+                new_chunks.append(para[:1000])
+
+        if not new_chunks:
+            return 0
+
+        # 把文字变成向量
+        vectors = self.model.encode(new_chunks)
+        # vectors.shape = (块数, 384)
+
+        # 加进 FAISS 索引
+        self.index.add(vectors.astype(np.float32))
+
+        # 记录原文和来源
+        for chunk in new_chunks:
+            self.chunks.append(chunk)
+            self.sources.append(source)
+
+        # 保存到硬盘（重启不丢）
+        self._save()
+
+        return len(new_chunks)
 
     def retrieve(self, query: str, top_k: int = 3) -> list[str]:
-        # retrieve = 你起的方法名（意为"检索"）。query = 查询词（你起的）。
-        # top_k = 返回前几条（你起的，默认 3）。-> list[str] = 返回字符串列表。
-        """
-        找到和问题最相关的文档块。
-        英文按词重叠计分，中文按字符重叠计分。
-        """
-        # ====== 空库检查 ======
-        if not self.chunks:
-            # not [] = True（空列表是假的）。啥都没存 → 直接返回空列表。
+        """问题 → 向量 → FAISS 找最近的几个 → 返回原文"""
+        if self.index.ntotal == 0:
             return []
 
-        # ====== 逐块打分 ======
-        scored = []  # 存 (分数, 索引) 元组列表
+        # 问题变成向量
+        query_vec = self.model.encode([query]).astype(np.float32)
+        # query_vec.shape = (1, 384)
 
-        for i, chunk in enumerate(self.chunks):
-            # enumerate() 同时拿索引 i 和内容 chunk。
-            # 第 1 轮：i=0, chunk="块A"
-            # 第 2 轮：i=1, chunk="块B"
+        # FAISS 搜索最近的 top_k 个
+        k = min(top_k, self.index.ntotal)
+        distances, indices = self.index.search(query_vec, k)
+        # distances = [[0.03, 0.15, 0.82]]  ← 距离，越小越相关
+        # indices   = [[2, 0, 5]]            ← 对应 chunks 列表的索引
 
-            score = 0
-
-            # ----- 英文：按空格分词 -----
-            # .lower() = 转小写——"AgentFlow" 和 "agentflow" 算同一个词
-            # .split() = 按空格切词（只对英文有效，中文没空格）
-            eng_q = set(query.lower().split())    # query 的英文词集合
-            eng_c = set(chunk.lower().split())    # chunk 的英文词集合
-            score += len(eng_q & eng_c)
-            # & = 集合交集——两边都有的词
-            # len(...) = 共有多少个英文词匹配
-
-            # ----- 中文：直接数字符重叠 -----
-            # set(字符串) = 把字符串拆成单个字符的集合
-            # "你好" → {"你", "好"}
-            # 中文没有空格分隔，所以不能 split()，直接数字符重叠。
-            cn_q = set(query)                    # query 的字符集合
-            cn_c = set(chunk)                    # chunk 的字符集合
-            score += len(cn_q & cn_c)            # 共有的中文字符数
-
-            # 分数 > 0 才进候选（0 分 = 完全无关）
-            if score > 0:
-                scored.append((score, i))
-                # (score, i) = 元组——打包分数和索引
-
-        # ====== 按分数排序 ======
-        scored.sort(reverse=True)
-        # reverse=True = 降序——分最高的排第一
-
-        # ====== 取前 top_k 条 ======
         results = []
-        for _, idx in scored[:top_k]:
-            # _ = 丢弃分数（不需要了，只要索引）
-            # idx = 文档块在 chunks 里的位置
-            src = self.sources[idx]             # 这个块来自哪个文件
-            results.append(f"[来源：{src}]\n{self.chunks[idx]}")
-            # f-string 拼格式——来源 + 换行 + 文档内容
+        for i, idx in enumerate(indices[0]):
+            if idx >= 0 and idx < len(self.chunks):
+                src = self.sources[idx]
+                dist = round(float(distances[0][i]), 4)
+                results.append(f"[来源：{src}] (相关度：{dist})\n{self.chunks[idx]}")
 
         return results
 
-    def clear(self):
-        """清空全部文档——重置为初始状态"""
+    def _save(self) -> None:
+        """保存到硬盘——FAISS 索引 + 文档元数据"""
+        idx_path = os.path.join(self.data_dir, "faiss.index")
+        meta_path = os.path.join(self.data_dir, "meta.pkl")
+
+        faiss.write_index(self.index, idx_path)
+        with open(meta_path, "wb") as f:
+            pickle.dump({"chunks": self.chunks, "sources": self.sources}, f)
+
+    def _load(self) -> None:
+        """从硬盘加载——如果有的话"""
+        idx_path = os.path.join(self.data_dir, "faiss.index")
+        meta_path = os.path.join(self.data_dir, "meta.pkl")
+
+        if os.path.exists(idx_path) and os.path.exists(meta_path):
+            self.index = faiss.read_index(idx_path)
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+                self.chunks = meta["chunks"]
+                self.sources = meta["sources"]
+            print(f"从硬盘加载了 {len(self.chunks)} 个文档块")
+
+    def clear(self) -> None:
+        """清空全部——内存 + 硬盘"""
         self.chunks = []
         self.sources = []
+        self.index = faiss.IndexFlatL2(self.dim)
+
+        idx_path = os.path.join(self.data_dir, "faiss.index")
+        meta_path = os.path.join(self.data_dir, "meta.pkl")
+        if os.path.exists(idx_path):
+            os.remove(idx_path)
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
 
 
-# ====== 全局实例 ======
-rag = SimpleRAG()
-# 模块加载时创建一次。server.py 里 from rag import rag 共用同一个实例。
-# 这是单例模式——所有地方操作同一个知识库。
+# 全局实例
+rag = VectorRAG()
+# 模块加载时创建一次。tools.py 里 from rag import rag 共用同一个实例。
 
 
-# ====== Q&A 问答笔记 ======
+# ====== Q&A 问答笔记（Day 17-18） ======
 #
-# Q1: SimpleRAG、chunks、sources、ingest、retrieve 是专有名词吗？
-# A1: 全是你自己起的名字。SimpleRAG 是类名，chunks/sources 是属性名，
-#     ingest/retrieve 是方法名，text/query/top_k 是参数名——一个系统保留词都没有。
-#     chunks 可以叫 kuai，ingest 可以叫 chi——但因为英文单词能描述功能，所以大家这么起。
+# Q1: SentenceTransformer 是什么？下载了什么？
+# A1: 把文字变成向量的工具。第一次运行时从镜像下载 all-MiniLM-L6-v2 模型（约 80MB），
+#     存到 C:\Users\wzyls\.cache\huggingface\ 里。下载一次以后从本地加载，不联网。
 #
-# Q2: ingest 和 retrieve 分别是干嘛的？text 和 query 有什么区别？
-# A2: ingest(吃进去)——上传文档时用。text 是一大篇文章，切成小块存起来。
-#     retrieve(取回来)——提问搜索时用。query 是一句话，用来匹配最相关的文档块。
-#     text 几百到几千字，query 几个到十几个字。方向相反：一个存，一个查。
+# Q2: all-MiniLM-L6-v2 是什么？
+# A2: 微软训练好的文字转向量模型。all=通用，MiniLM=轻量架构，L6=6层，v2=第二版。
+#     输出 384 维向量。主要支持英文，中文效果一般。中文专用模型用 text2vec-base-chinese。
 #
-# Q3: self 是什么？为什么每个方法第一个参数都是 self？
-# A3: Python 自动把"调用者"作为第一个参数传进去。
-#     rag.ingest("文档","来源") 看似只传了两个参数，
-#     Python 帮你塞了 rag 自己到第一位 → 等价于 SimpleRAG.ingest(rag, "文档", "来源")。
-#     self 就是那个被塞进来的 rag。不是关键字，但全世界都这么写。
+# Q3: FAISS 是什么？
+# A3: Meta 开源的向量搜索引擎——给一个向量，在几百万个向量里快速找最近的几个。
+#     用 C++ 写的，比 Python for 循环快几百倍。IndexFlatL2 = 暴力 L2 距离搜索。
 #
-# Q4: re.split(r"\n\s*\n", text.strip()) 是干什么的？能切什么？
-# A4: 按段落之间的空行切分文档。
-#     \n\s*\n = 换行 + 可能有些空白 + 换行 = 空行。
-#     比如 "今天天气很好\n\n我想出去玩" 会被切成 ["今天天气很好", "我想出去玩"]。
-#     text.strip() 先把首尾空白去掉，防止开头空行被切出一个空段落。
+# Q4: 为什么国内要设 HF_ENDPOINT 镜像？
+# A4: HuggingFace（模型托管网站）在国内连不上。hf-mirror.com 是国内镜像站——
+#     内容一样，服务器在国内。必须在 import sentence_transformers 之前设置，否则太晚。
 #
-# Q5: \s* 是什么？
-# A5: \s = 任何空白字符（空格、Tab、换行、回车）。
-#     * = 前面的东西可以出现 0 次或多次。
-#     \s* = 可能有空白也可能没有——不管中间夹了几个空格都能匹配空行。
+# Q5: get_embedding_dimension() 是干什么的？
+# A5: 问模型"你输出的向量是几维的"。all-MiniLM-L6-v2 返回 384。
+#     换模型时不用手改维度——这个方法自动返回正确值。
+#     注意：旧版叫 get_sentence_embedding_dimension()，新版改名了。
 #
-# Q6: para[:1000] 是从哪里开始截的？
-# A6: 从第一个字符开始（索引 0）。[:1000] 等价于 [0:1000]——从头取到第 1000 个（不含）。
-#     冒号左边不写数字 Python 默认填 0。不是截原字符串，是新建一个被截断的副本。
+# Q6: ./data/rag 是哪里？os.makedirs 是干什么的？
+# A6: ./ = 你运行 python 命令时所在的文件夹。在 myagent 下跑就是 myagent/data/rag/。
+#     os.makedirs(路径, exist_ok=True) = 创建文件夹。exist_ok=True = 已存在不报错。
+#     创建一次就行，以后每次启动自动跳过。
 #
-# Q7: enumerate() 是干嘛的？
-# A7: 同时拿索引和值。for i, chunk in enumerate(self.chunks)——
-#     第 1 轮 i=0,chunk="块A"；第 2 轮 i=1,chunk="块B"。比手写 i=0;i+=1 省两行。
+# Q7: 哪些是自己起的名字，哪些是系统定的？
+# A7: 自己起的：model_name, data_dir, self.model, self.dim, self.index,
+#              self.chunks, self.sources, self.data_dir, VectorRAG
+#     系统定的：__init__, self, SentenceTransformer, get_embedding_dimension(),
+#              faiss, IndexFlatL2, os.makedirs, exist_ok
+#     模型名 "all-MiniLM-L6-v2" 是模型作者起的——改了找不到模型。
+#     记忆口诀：self. 后面的属性名 = 你起的。import 进来的 = 别人定的。
 #
-# Q8: set() 和 & 分别是干嘛的？
-# A8: set() 把列表或字符串转成集合（自动去重）。& 是集合交集——两边都有的元素。
-#     {"a","b","c"} & {"b","c","d"} → {"b","c"}。len(...) 统计共有多少个。
+# Q8: 向量距离怎么算的？
+# A8: L2 欧氏距离 = √((a₁-b₁)² + (a₂-b₂)² + ... + (a₃₈₄-b₃₈₄)²)
+#     就是线性代数里两点距离公式——从二维推广到 384 维。
+#     Python 写法：sum((a-b)**2 for a,b in zip(v1,v2))**0.5
+#     zip() 配对 → (a-b)**2 差的平方 → sum() 求和 → **0.5 开根号
 #
-# Q9: for _, idx in scored[:top_k] 里的 _ 是什么？
-# A9: Python 约定——"这个变量我不需要，占个位置而已"。
-#     scored 里每个元素是 (分数, 索引) 元组，只需要索引不需要分数，用 _ 扔掉分数。
+# Q9: 为什么测试 3（"今天天气怎么样"）也返回了结果？
+# A9: FAISS 总是返回最近的 top_k 个，不管多远。知识库只有一块——
+#     不管问什么都返回那一块。加距离阈值过滤（距离>1.2就不返回）可以解决。
 #
-# Q10: rag = SimpleRAG() 为什么放在文件最下面而不是里面？
-# A10: 全局实例——模块加载时创建一次，所有人共享同一个对象。
-#      放在函数里每次调用都新建——知识库就白存了。
-#      单例模式：同一个对象到处用，上传和搜索操作同一份数据。
+# Q10: pickle 存了什么？存在哪？
+# A10: _save() 存两个文件到 ./data/rag/：
+#      faiss.index = FAISS 向量索引（二进制）
+#      meta.pkl = 文档原文和来源（pickle 序列化的 Python 字典）
+#      _load() 启动时从这两个文件恢复——重启 server.py 数据不丢。
 #
-# Q11: 上传的文档关掉 server.py 后会消失吗？
-# A11: 会。rag.chunks 存在内存里，进程关了就没了。
-#      重启后需要重新上传。和 ConversationMemory 一样的命运。
-#      持久化存储需要 FAISS + pickle（进阶功能）。
+# Q11: 这些知识是哪个阶段学的？
+# A11: FAISS/Embedding/sentence-transformers = 研究生或 AI 工程师入职培训。
+#      pickle/numpy/os.makedirs = 大二 Python 进阶。
+#      L2 距离 = 大一线性代数（你已经学了）。
+#      你大一用研究生的工具，但用的是工程方式（调 API），不是研究方式（推公式）。

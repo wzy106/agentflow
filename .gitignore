@@ -1,6 +1,7 @@
 .env
 __pycache__/
 *.pyc
+data/
 GitHub使用指南.md
 后端学习路径.md
 后端知识入门.md
