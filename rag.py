@@ -14,6 +14,7 @@ import pickle
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
+from config import config
 
 
 class VectorRAG:
@@ -132,7 +133,7 @@ class VectorRAG:
 
 
 # 全局实例
-rag = VectorRAG()
+rag = VectorRAG(model_name=config.embedding_model, data_dir=config.rag_data_dir)
 # 模块加载时创建一次。tools.py 里 from rag import rag 共用同一个实例。
 
 
@@ -193,3 +194,63 @@ rag = VectorRAG()
 #      pickle/numpy/os.makedirs = 大二 Python 进阶。
 #      L2 距离 = 大一线性代数（你已经学了）。
 #      你大一用研究生的工具，但用的是工程方式（调 API），不是研究方式（推公式）。
+#
+# Q12: os.path.join() 为什么不直接写路径字符串？
+# A12: Windows 用 \，Linux 用 /。os.path.join() 自动适配——代码搬到服务器也能跑。
+#      os.path.join("./data/rag", "faiss.index") → Windows: .\data\rag\faiss.index
+#                                                  → Linux: ./data/rag/faiss.index
+#
+# Q13: open("wb") 和 open("rb") 里的 b 是什么？
+# A13: b = binary（二进制）。pickle 存的是二进制数据不是文本。
+#      写用 "wb"（write binary），读用 "rb"（read binary）。
+#      不加 b 用文本模式会报错或数据损坏。
+#
+# Q14: pickle.dump 和 pickle.load 分别做什么？
+# A14: dump = 把 Python 对象变成二进制写进文件（序列化）。
+#      load = 从文件读二进制还原成 Python 对象（反序列化）。
+#      存进去是字典，读出来还是字典——格式不变。
+#      注意：不要 load 不信任来源的 .pkl 文件——攻击者可以在里面藏恶意代码。
+#
+# Q15: with open(...) as f 为什么不用手动 f.close()？
+# A15: with 是上下文管理器——写完/读完自动关文件。
+#      就算中间报错也会自动关——不会留下没关的文件句柄。
+#
+# Q16: model.encode([query]) 为什么要套方括号？
+# A16: encode("你好") 返回一维数组 (384,)——FAISS 不认。
+#      encode(["你好"]) 返回二维数组 (1, 384)——FAISS 要这个。
+#      FAISS 的 search() 要求输入是二维的，即使只搜一条也要包成列表。
+#
+# Q17: .astype(np.float32) 为什么必须加？
+# A17: model.encode() 输出 float64，FAISS 只认 float32。不转直接报错。
+#      float32 精度够用（384 维不需要 64 位），还省一半内存。
+#
+# Q18: clear() 为什么要同时清内存和硬盘？
+# A18: 只清内存不清硬盘 → 重启后 _load() 又读回来了，没清干净。
+#      只清硬盘不清内存 → 当前会话还能搜到旧内容，重启后才真正干净。
+#      两边都清 → 立刻生效，不用等重启。
+#
+# Q19: FAISS 索引为什么不能 clear() 只能重建？
+# A19: FAISS 的 IndexFlatL2 没有清空方法。
+#      self.index = faiss.IndexFlatL2(self.dim) 直接造一个新的空索引替换旧的。
+#      旧索引没人引用后被 Python 垃圾回收自动释放内存。
+#
+# Q20: self.index 是什么？为什么要 faiss.IndexFlatL2(self.dim)？
+# A20: self.index 是向量仓库——存向量、搜向量的容器。
+#      faiss.IndexFlatL2(384) = 创建一个空仓库：能存 384 维向量，用 L2 距离搜索。
+#      Index=索引，Flat=暴力逐个对比，L2=欧氏距离。
+#      创建后能干三件事：.add(向量) 存入，.search(向量, k) 搜索，.ntotal 查数量。
+#      类比：chunks 是书架（存原文），index 是目录（存向量，按距离快速查找）。
+#
+# Q21: distances 和 indices 分别是什么？怎么配合使用？
+# A21: self.index.search(query_vec, 3) 返回两个数组：
+#      distances = [[0.38, 1.15, 1.42]] — 每个结果离问题多远（越小越相关）
+#      indices   = [[0, 3, 1]]          — 每个结果在 chunks 列表里的位置（门牌号）
+#      distances 告诉你"靠不靠谱"，indices 告诉你"去哪找内容"。
+#      用 indices 的值去 self.chunks[idx] 取原文，用 distances 的值显示相关度。
+#      类比：distances = 每家店离你多远，indices = 每家店的门牌号。
+#
+# Q22: 为什么 _save/_load/clear 三个函数重复写 os.path.join？
+# A22: 因为 idx_path 和 meta_path 是局部变量——函数结束就消失。
+#      三个函数各自独立，一个函数的局部变量另一个看不到。
+#      更好的写法：在 __init__ 里存成 self.idx_path 和 self.meta_path，
+#      三个函数共享——算一次，到处用。现在的写法不是错，只是重复了。

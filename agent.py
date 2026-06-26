@@ -23,6 +23,7 @@ from openai import OpenAI
 
 from tools import execute, get_all_schemas
 from memory import ConversationMemory
+from config import config
 # execute(name, **kwargs)        → 按名字执行工具（查字典 → 调函数）
 # get_all_schemas()              → 获取所有工具的说明书（给 AI 看）
 # ConversationMemory             → 对话记忆——让 AI 记住之前的对话
@@ -31,18 +32,38 @@ load_dotenv()
 # 把 .env 里的三行密码加载到内存
 
 client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
+    api_key=config.api_key,
+    base_url=config.base_url,
 )
 # 创建 API 客户端。参数名 api_key/base_url 是库定死的，必须小写。
 # 变量名 client 是你起的，可以随便换。
 
 # 全局对话记忆——所有 chat() 调用共享同一本日记本
-memory = ConversationMemory(
-    system_prompt="你是一个助手。遇到计算、搜索、代码执行必须用对应工具，不要自己猜。"
-)
+memory = ConversationMemory(system_prompt=config.system_prompt)
 # system_prompt 在创建日记本时写进第一页——之后每次 get_messages() 都会带上。
 # 这是全局变量（模块级），所有 chat() 调用共享——所以能跨轮记住上下文。
+
+
+# ====== Day 19：模型降级函数 ======
+
+def call_llm(messages, tools=None):
+    """调用 LLM——主模型失败时自动降级到备用模型"""
+    models = [config.primary_model, config.backup_model]
+    for model_name in models:
+        try:
+            kwargs = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": config.temperature,
+                "max_tokens": config.max_tokens,
+            }
+            if tools:
+                kwargs["tools"] = tools
+            response = client.chat.completions.create(**kwargs)
+            return response
+        except Exception as e:
+            print(f"模型 {model_name} 失败：{e}，尝试降级...")
+    return None
 
 
 # ====== 核心函数 ======
@@ -58,18 +79,16 @@ def chat(user_input: str) -> str:
     # 这样上一轮说过的话还留在日记本里，AI 能看到。
 
     # ====== 第 2 步：ReAct 循环 ======
-    max_steps = 10
+    max_steps = config.max_steps
     step = 0
 
     while step < max_steps:
         step += 1
 
         tools = get_all_schemas()
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL"),
-            messages=memory.get_messages(),  # ← 从记忆拿全部历史（带滑动窗口）
-            tools=tools,
-        )
+        response = call_llm(memory.get_messages(), tools)
+        if response is None:
+            return "所有模型都无法响应，请稍后再试。"
         msg = response.choices[0].message
 
         # ====== 不需要工具 → 最终回答！ ======
@@ -238,3 +257,29 @@ if __name__ == "__main__":
 #      add_assistant_message → 追加 role="assistant"，如果调了工具一并贴上 tool_calls。
 #      add_tool_result → 追加 role="tool"，绑定 tool_call_id。
 #      好处：不用记字段名，不用写重复的 {"role":"...","content":"..."}。
+#
+# Q21: Day 19 工具重试是怎么实现的？（tools.py 的 execute）
+# A21: execute() 里套了 for attempt in range(1, 4) 循环——最多试 3 次。
+#      成功 → return 跳出循环。失败 → 打印提示，继续下一次。3 次全失败 → 返回错误信息。
+#      重试应对的是"偶尔波动"（网络超时），不是"永久故障"（API Key 错了）。
+#
+# Q22: call_llm() 模型降级是怎么实现的？
+# A22: models 列表按优先级排——先试主模型，失败了试备用模型。
+#      for model_name in models + try/except：成功就 return，失败就继续试下一个。
+#      全失败返回 None——调用端检查 if response is None 做最终处理。
+#      类比：打电话叫外卖，第一家没接就打第二家。两家都没接就放弃。
+#
+# Q23: call_llm() 里 tools=None 为什么不是一直 None？
+# A23: tools=None 是默认值——只有调用时不传才是 None。
+#      call_llm(messages, tools) → tools 是你传的那个值（工具说明书列表）。
+#      call_llm(messages) → tools 用默认值 None（纯聊天不需要工具）。
+#      默认值的意思是"你不说我就当没有"，不是"永远都是 None"。
+#
+# Q24: kwargs = {"model":..., "messages":...} 然后 if tools: kwargs["tools"] = tools 为什么这样写？
+# A24: 动态构建参数——先放必要的，按条件加可选的，最后 **kwargs 拆开传。
+#      如果 tools 是 None 就不加——有些模型收到空 tools 参数会报错。不传比传空更安全。
+#
+# Q25: return None 有什么用？调用端怎么处理？
+# A25: 所有模型都失败时返回 None——这是一个"全失败信号"。
+#      调用端必须检查：if response is None: return "所有模型无法响应"。
+#      不检查就会 response.choices[0] 报 NoneType has no attribute 'choices'。

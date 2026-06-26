@@ -82,46 +82,25 @@ def register(name, description, parameters, func):
 
 
 def execute(name, **kwargs):
-#              ^^^^^^^^
-#  **kwargs：把散装命名参数收进一个字典
-#  execute("calculate", expression="2+2") → kwargs = {"expression": "2+2"}
-    """按名字执行工具"""
-
-    # ====== 查字典找函数 ======
+    """按名字执行工具——失败自动重试 3 次（Day 19 升级）"""
     func = _tools.get(name)
-    # .get() 和 [] 的区别：
-    # _tools["不存在的"] → KeyError，程序崩溃
-    # _tools.get("不存在的") → None，安全返回
-    # 用 .get() 防御——AI 可能会叫错工具名
-
     if func is None:
         return f"错误：未知工具 '{name}'"
 
-    # ====== 执行工具 ======
-    try:
-        result = func(**kwargs)
-        # **kwargs：把字典拆回散装参数
-        # func(**{"expression": "2+2"}) 等价于 func(expression="2+2")
-        # 等价于 safe_calc(expression="2+2")
-        #
-        # 同一个 ** 两个方向：
-        #   定义时 def f(**kwargs) → ** 收集：散装参数 → 字典
-        #   调用时 f(**kwargs)     → ** 拆开：字典 → 散装参数
-        #   "收进来是字典，传出去是参数"——透明转发
+    max_retries = 3
 
-        # ====== 处理异步函数 ======
-        import asyncio
-        if asyncio.iscoroutine(result):
-            # iscoroutine() 判断是不是"协程对象"（异步函数没跑完的状态）
-            # 普通函数（safe_calc）→ 返回 "2+2=4" → iscoroutine → False → 直接返回
-            # 异步函数（execute_code）→ 返回 <coroutine> → iscoroutine → True
-            return asyncio.run(result)
-            # asyncio.run() 启动事件循环，等异步函数跑完，拿到真实结果
-        return result
-
-    except Exception as e:
-        # 工具内部崩了 → 不炸主程序，转成错误信息返回
-        return f"错误：{e}"
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = func(**kwargs)
+            import asyncio
+            if asyncio.iscoroutine(result):
+                result = asyncio.run(result)
+            return result
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"工具 {name} 第 {attempt} 次失败：{e}，重试中...")
+            else:
+                return f"工具 {name} 执行失败（重试 {max_retries} 次）：{e}"
 
 
 def get_all_schemas():
@@ -215,3 +194,26 @@ register(
 # A8: 零行。只在 tools.py 里加了一个函数 + 一个 register()。
 #     agent.py 的 while 循环自动拿到新工具的说明书，AI 自动决定什么时候调它。
 #     这就是注册表模式的价值——第四个工具和第一个工具加法一模一样。
+#
+# Q9: Day 19 工具重试怎么实现的？
+# A9: execute() 里 for attempt in range(1, 4) 循环 3 次。
+#     try 里执行工具——成功 return 跳出循环。
+#     except 里判断 attempt < max_retries：还有机会就打印提示继续循环，用完就返回错误。
+#     类比：去便利店买水，店员说稍等，问三次还没有就走人。
+#
+# Q10: 为什么 return result 写在 try 里面？
+# A10: 成功了立刻走——不试剩下的次数。
+#      如果写在 try 外面，失败了也会执行到 return，拿到的是上一次的错误结果。
+#
+# Q11: 重试之间为什么没有等待（sleep）？
+# A11: 简化版不等——第 1 次失败立刻试第 2 次。
+#      真实系统会加 time.sleep(1) 等一秒再试，避免连续轰炸服务器。
+#      你的项目里工具都在本地跑（计算器、代码执行），不需要等。搜索工具如果是远程 API 建议加等待。
+#
+# Q12: import asyncio 为什么写在循环里不影响性能？
+# A12: Python 的 import 有缓存——第一次 import 加载模块，第二次 import 直接从缓存取，瞬间完成。
+#      写在函数里是"用到才加载"（懒加载），不用异步工具时不加载 asyncio 模块。
+#
+# Q13: attempt < max_retries 怎么判断还有没有机会？
+# A13: max_retries = 3。attempt = 1 时 1 < 3 = True → 还有机会，继续。
+#      attempt = 2 时 2 < 3 = True → 还有机会。attempt = 3 时 3 < 3 = False → 没机会了，进 else 放弃。

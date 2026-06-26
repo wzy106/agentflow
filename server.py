@@ -13,31 +13,54 @@ from fastapi import FastAPI, Request
 # FastAPI              → Python 的 Web 框架，创建网页服务
 # Request              → 请求对象，前端发来的所有数据
 
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 # HTMLResponse          → 返回网页
 # StreamingResponse      → 返回持续推送的数据流（SSE）
+# JSONResponse           → 返回 JSON 格式响应（如 401 认证失败）
 
 from openai import OpenAI
 
 from tools import execute, get_all_schemas
 from memory import ConversationMemory
 from rag import rag
+from config import config
 
 load_dotenv()
 
 client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
+    api_key=config.api_key,
+    base_url=config.base_url,
 )
 
 # 全局记忆——server.py 也需要日记本！
-memory = ConversationMemory(
-    system_prompt="你是一个助手。遇到计算、搜索、代码执行必须用工具。用中文回答。"
-)
+memory = ConversationMemory(system_prompt=config.system_prompt)
 
 app = FastAPI(title="AgentFlow")
 # FastAPI() 创建 Web 应用——"开一家店"
 # title 显示在自动生成的 API 文档页面（/docs）上
+
+
+# ====== Day 21：认证中间件 ======
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """检查 API Key——除了首页，其他接口都要带 Authorization 头"""
+    # 首页放行——不然登录框都不给人看
+    if request.url.path == "/":
+        return await call_next(request)
+    # 没配密钥 → 跳过检查（开发环境友好）
+    if not config.api_auth_key:
+        return await call_next(request)
+    # 检查 Authorization: Bearer <key>
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {config.api_auth_key}"
+    if auth != expected:
+        return JSONResponse(
+            {"ok": False, "error": "无效的 API Key"},
+            status_code=401,
+        )
+    return await call_next(request)
+# call_next(request) = 把请求交给下一个处理者——路由函数（chat_endpoint 等）
+# 如果返回 JSONResponse 就不继续往下走了，直接返回给浏览器。
 
 
 # ====== 首页（前端内容——后端面试不需要深究） ======
@@ -91,10 +114,42 @@ async def home():
         background: #533483; color: #fff; border: none;
         border-radius: 6px; padding: 10px 18px; cursor: pointer; font-size: 14px;
     }
+    /* ====== Day 21：登录框样式 ====== */
+    #login-overlay {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        background: rgba(26,26,46,0.95); display: flex;
+        align-items: center; justify-content: center; z-index: 100;
+    }
+    #login-box {
+        background: #16213e; padding: 30px; border-radius: 10px;
+        border: 1px solid #0f3460; text-align: center; min-width: 320px;
+    }
+    #login-box h2 { margin-bottom: 8px; font-size: 20px; }
+    #login-box p { color: #a0a0c0; font-size: 13px; margin-bottom: 16px; }
+    #login-box input {
+        width: 100%; background: #1a1a2e; border: 1px solid #0f3460;
+        border-radius: 6px; padding: 10px; color: #eee; font-size: 14px;
+        outline: none; margin-bottom: 12px;
+    }
+    #login-box button {
+        background: #533483; color: #fff; border: none;
+        border-radius: 6px; padding: 10px 24px; cursor: pointer; font-size: 14px;
+    }
+    #login-error { color: #e0557a; font-size: 12px; margin-top: 8px; display: none; }
 </style>
 <!-- 以上 <style> 是 CSS——控制颜色和布局。后端面试不问。 -->
 </head>
 <body>
+<!-- ====== Day 21：登录框 ====== -->
+<div id="login-overlay">
+    <div id="login-box">
+        <h2>AgentFlow</h2>
+        <p>请输入 API Key 以继续</p>
+        <input id="loginKey" type="password" placeholder="API Key" autofocus>
+        <button id="loginBtn">进入</button>
+        <div id="login-error">API Key 无效，请重试</div>
+    </div>
+</div>
 <header>AgentFlow — 我的 AI 助手</header>
 <div id="chat">
     <div class="msg ai">你好！我能计算、搜索、执行代码。试试问我问题吧！</div>
@@ -106,6 +161,42 @@ async def home():
 <script>
 // 以下 <script> 是 JavaScript——前端逻辑。后端面试不问。
 // 只需要知道：用户点发送 → JS 往 /chat 发 POST 请求 → 用 EventSource 接收 SSE 流
+// ====== Day 21：认证逻辑 ======
+let apiKey = sessionStorage.getItem('apiKey') || '';
+const loginOverlay = document.getElementById('login-overlay');
+const loginKey = document.getElementById('loginKey');
+const loginBtn = document.getElementById('loginBtn');
+const loginError = document.getElementById('login-error');
+const mainUI = document.querySelectorAll('header, #chat, #input-area');
+
+// 没密钥 → 显示登录框；有密钥 → 隐藏登录框，显示聊天界面
+function updateUI() {
+    if (apiKey) {
+        loginOverlay.style.display = 'none';
+        mainUI.forEach(el => el.style.display = '');
+        input.focus();
+    } else {
+        loginOverlay.style.display = 'flex';
+        mainUI.forEach(el => el.style.display = 'none');
+        loginKey.focus();
+    }
+}
+
+loginBtn.addEventListener('click', () => {
+    apiKey = loginKey.value.trim();
+    if (apiKey) {
+        sessionStorage.setItem('apiKey', apiKey);
+        updateUI();
+    }
+});
+loginKey.addEventListener('keydown', e => {
+    if (e.key === 'Enter') loginBtn.click();
+});
+
+// 页面加载时初始化
+updateUI();
+if (apiKey) loginKey.value = apiKey;
+
 const chatBox = document.getElementById('chat');
 const input = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
@@ -131,9 +222,22 @@ async function send() {
     try {
         const res = await fetch('/chat', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + apiKey,
+            },
             body: JSON.stringify({ message: text }),
         });
+        // 401 → API Key 无效，踢回登录框
+        if (res.status === 401) {
+            sessionStorage.removeItem('apiKey');
+            apiKey = '';
+            updateUI();
+            loginError.style.display = 'block';
+            sending = false;
+            sendBtn.disabled = false;
+            return;
+        }
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buf = '';
@@ -218,60 +322,63 @@ async def chat_endpoint(request: Request):
         # .format() 而不是 f-string 的原因：
         #   JSON 里也是 {}，f-string 会混淆。.format() 只有一个占位符 {}。
 
-        # ====== 把用户消息写入记忆（同 agent.py Day 12） ======
+        # ====== 把用户消息写入记忆 ======
         memory.add_user_message(user_input)
 
-        tools = get_all_schemas()
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL"),
-            messages=memory.get_messages(),   # ← 从记忆拿全部历史
-            tools=tools,
-        )
+        # ====== 完整版 ReAct 循环（和 agent.py 一致） ======
+        max_steps = config.max_steps
+        step = 0
 
-        msg = response.choices[0].message
+        while step < max_steps:
+            step += 1
 
-        # ====== 不需要工具 → 直接推送结果 ======
-        if not msg.tool_calls:
-            memory.add_assistant_message(msg.content)
-            yield "data: {}\n\n".format(json.dumps({"type": "final", "content": msg.content}))
-            yield "data: {}\n\n".format(json.dumps({"type": "done"}))
-            return
+            tools = get_all_schemas()
+            try:
+                response = client.chat.completions.create(
+                    model=config.primary_model,
+                    messages=memory.get_messages(),
+                    tools=tools,
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens,
+                )
+            except Exception as e:
+                yield "data: {}\n\n".format(json.dumps({"type": "final", "content": f"模型调用失败：{e}"}))
+                yield "data: {}\n\n".format(json.dumps({"type": "done"}))
+                return
 
-        # ====== 需要工具 → 写入记忆 ======
-        tool_calls_list = [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]
-        memory.add_assistant_message(msg.content or "", tool_calls_list)
+            msg = response.choices[0].message
 
-        # ====== 逐个执行工具 ======
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            args = json.loads(tc.function.arguments)
-            result = execute(name, **args)
+            # 不需要工具 → 最终回答
+            if not msg.tool_calls:
+                memory.add_assistant_message(msg.content)
+                yield "data: {}\n\n".format(json.dumps({"type": "final", "content": msg.content}))
+                yield "data: {}\n\n".format(json.dumps({"type": "done"}))
+                return
 
-            yield "data: {}\n\n".format(json.dumps({
-                "type": "tool",
-                "tool": name,
-                "result": result,
-            }))
+            # 需要工具 → 写入记忆
+            tool_calls_list = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ]
+            memory.add_assistant_message(msg.content or "", tool_calls_list)
 
-            memory.add_tool_result(tc.id, result)
+            # 逐个执行工具
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                result = execute(name, **args)
 
-        # ====== 第二轮调 AI（总结） ======
-        final = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL"),
-            messages=memory.get_messages(),
-        )
+                yield "data: {}\n\n".format(json.dumps({
+                    "type": "tool",
+                    "tool": name,
+                    "result": result,
+                }))
 
-        # ====== 推送 3：最终回答 ======
-        yield "data: {}\n\n".format(json.dumps({
-            "type": "final",
-            "content": final.choices[0].message.content,
-        }))
+                memory.add_tool_result(tc.id, result)
+            # 循环继续——AI 看到工具结果后决定是否还需要更多工具
 
-        # ====== 推送 4：结束信号 ======
+        yield "data: {}\n\n".format(json.dumps({"type": "final", "content": "达到最大步数，暂时无法完成。"}))
         yield "data: {}\n\n".format(json.dumps({"type": "done"}))
 
     # ====== 返回 SSE 流 ======
@@ -312,7 +419,7 @@ if __name__ == "__main__":
     import uvicorn
     # uvicorn = ASGI 服务器（跑 FastAPI 的程序）
 
-    uvicorn.run(app, host="0.0.0.0", port=9000)
+    uvicorn.run(app, host=config.host, port=config.port)
     #           ^^^   ^^^^^          ^^^^
     #           FastAPI 应用  0.0.0.0 = 监听所有网络接口
     #                          本机 + 局域网内其他设备都能访问
@@ -426,3 +533,22 @@ if __name__ == "__main__":
 # A21: 开一家店（FastAPI）→ 贴铭牌（@app.post）→ 客人递纸条（request.json）
 #      → 厨房做菜不能等全做完（StreamingResponse）→ 做一道上一道（yield）
 #      → 每一步都给客人反馈（SSE data:）→ 客人吃完走人。每一步都解决前一步的问题。
+#
+# Q22: /rag/upload 用 POST，/rag/search 用 GET，为什么不同？
+# A22: POST = 往服务器塞东西（上传文档）。GET = 从服务器取东西（搜索结果）。
+#      POST 的参数在请求体里（JSON），GET 的参数在 URL 里（?q=关键词）。
+#
+# Q23: POST 和 GET 取参数的方式为什么不一样？
+# A23: POST：body = await request.json() → body.get("text", "")。手动从请求体取。
+#      GET：async def rag_search(q: str = "")。FastAPI 自动把 URL 参数 ?q=xxx 绑到函数参数 q 上。
+#      GET 更简洁——FastAPI 看到函数参数名和 URL 参数名一样就自动绑定。
+#
+# Q24: return {"ok": True, "chunks": count} 是怎么变成 JSON 的？
+# A24: FastAPI 看到你 return 一个字典，自动帮你转成 JSON 响应发回前端。
+#      你不需要手动 json.dumps()——FastAPI 在底层帮你做了。
+#      前端收到的是 {"ok": true, "chunks": 1}（JSON 格式）。
+#
+# Q25: {"ok": False, "error": "内容为空"} 是固定格式吗？
+# A25: 不是。"ok" 和 "error" 都是你自己起的键名——你和前端之间的约定。
+#      换成 {"success": false, "msg": "空的"} 也能跑，只要前端也跟着改。
+#      但 ok/error 是业界常见写法——大家一看就懂。
